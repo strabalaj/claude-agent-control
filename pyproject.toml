@@ -9,6 +9,7 @@ dependencies = [
     "anthropic>=0.75.0",
     "fastapi>=0.123.5",
     "python-dotenv>=1.2.1",
+    "python-multipart>=0.0.21",
     "sqlalchemy>=2.0.44",
     "uvicorn>=0.38.0",
 ]
