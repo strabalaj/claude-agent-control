@@ -92,19 +92,56 @@ View API documentation: `http://localhost:8000/docs`
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| WS | `/ws/agents/{agent_id}/execute` | Real-time agent execution with status updates |
+| WS | `/ws/agents/{agent_id}/execute` | Real-time agent execution with streaming support |
 
 **Message Protocol:**
-- **Client → Server**: `{"type": "execute", "variables": {...}}`
-- **Server → Client**: Status updates, results, and errors as JSON messages
 
-**Connection Flow:**
+**Client → Server** (Execute Request):
+```json
+{
+  "type": "execute",
+  "variables": {...},              // Optional: Variables for prompt template
+  "stream": true,                  // Optional: Enable streaming (default: false)
+  "stream_events": ["text"]        // Optional: Event types to receive (default: ["text"])
+}
+```
+
+**Stream Event Types:**
+- `"text"` - Text deltas (content_block_delta with text_delta)
+- `"thinking"` - Extended thinking deltas (thinking_delta)
+- `"tool_use"` - Tool use JSON deltas (input_json_delta)
+- `"all"` - All event types
+
+**Server → Client** (Message Types):
+
+| Type | Description | When Sent |
+|------|-------------|-----------|
+| `connected` | Connection established | On WebSocket connect |
+| `status` | Execution status update | Before execution starts |
+| `stream_start` | Streaming initiated | When stream=true, before first delta |
+| `content_delta` | Token-by-token content | During streaming (real-time) |
+| `stream_end` | Streaming completed | When stream=true, after last delta |
+| `result` | Final execution result | After execution completes |
+| `error` | Execution error | On failure |
+
+**Connection Flow (Non-Streaming):**
 1. Connect to WebSocket endpoint
 2. Receive `connected` message with agent info
 3. Send `execute` request with optional variables
 4. Receive `status` updates during execution
 5. Receive `result` (success) or `error` (failure) message
 6. Connection stays open for multiple executions
+
+**Connection Flow (Streaming):**
+1. Connect to WebSocket endpoint
+2. Receive `connected` message with agent info
+3. Send `execute` request with `stream: true`
+4. Receive `status` update
+5. Receive `stream_start` message
+6. Receive multiple `content_delta` messages (real-time tokens)
+7. Receive `stream_end` message with final usage stats
+8. Receive `result` message with execution_id
+9. Connection stays open for multiple executions
 
 ### Skill Management
 
@@ -206,6 +243,7 @@ curl -X POST http://localhost:8000/skills/custom \
 
 ### 6. WebSocket Real-Time Execution (Python)
 
+**Non-Streaming Example:**
 ```python
 import asyncio
 import websockets
@@ -245,8 +283,58 @@ async def execute_agent_websocket():
 asyncio.run(execute_agent_websocket())
 ```
 
+**Streaming Example:**
+```python
+import asyncio
+import websockets
+import json
+
+async def execute_agent_streaming():
+    uri = "ws://localhost:8000/ws/agents/1/execute"
+
+    async with websockets.connect(uri) as ws:
+        # 1. Receive connected message
+        connected = json.loads(await ws.recv())
+        print(f"Connected to agent: {connected['agent_name']}\n")
+
+        # 2. Send execute request with streaming enabled
+        await ws.send(json.dumps({
+            "type": "execute",
+            "variables": {"document_name": "report.pdf"},
+            "stream": True,
+            "stream_events": ["text"]  # Or ["all"] for all events
+        }))
+
+        # 3. Receive streaming messages
+        async for message in ws:
+            data = json.loads(message)
+
+            if data['type'] == 'stream_start':
+                print(f"Stream started (model: {data['model']})")
+
+            elif data['type'] == 'content_delta':
+                # Print tokens in real-time as they arrive
+                print(data['delta'], end='', flush=True)
+
+            elif data['type'] == 'stream_end':
+                print(f"\n\nStream complete:")
+                print(f"  - Tokens: {data['usage']['total_tokens']}")
+                print(f"  - Stop reason: {data['stop_reason']}")
+
+            elif data['type'] == 'result':
+                print(f"  - Execution ID: {data['execution_id']}")
+                break
+
+            elif data['type'] == 'error':
+                print(f"Error: {data['error']}")
+                break
+
+asyncio.run(execute_agent_streaming())
+```
+
 ### 7. WebSocket Real-Time Execution (TypeScript)
 
+**Non-Streaming Example:**
 ```typescript
 interface WSMessage {
   type: 'connected' | 'status' | 'result' | 'error';
@@ -300,15 +388,100 @@ ws.onerror = (error: Event) => {
 };
 ```
 
+**Streaming Example:**
+```typescript
+interface StreamingWSMessage {
+  type: 'connected' | 'status' | 'stream_start' | 'content_delta' | 'stream_end' | 'result' | 'error';
+  agent_id?: number;
+  agent_name?: string;
+  message?: string;
+  message_id?: string;
+  model?: string;
+  delta_type?: 'text_delta' | 'thinking_delta' | 'input_json_delta';
+  delta?: string;
+  index?: number;
+  stop_reason?: string;
+  usage?: {
+    input_tokens: number;
+    output_tokens: number;
+    total_tokens: number;
+  };
+  output?: string;
+  execution_id?: number;
+  error?: string;
+}
+
+const ws = new WebSocket('ws://localhost:8000/ws/agents/1/execute');
+
+ws.onmessage = (event: MessageEvent) => {
+  const data: StreamingWSMessage = JSON.parse(event.data);
+
+  switch(data.type) {
+    case 'connected':
+      console.log(`Connected to agent: ${data.agent_name}\n`);
+      // Send execute request with streaming enabled
+      ws.send(JSON.stringify({
+        type: 'execute',
+        variables: { document_name: 'report.pdf' },
+        stream: true,
+        stream_events: ['text']  // Or ['all'] for all events
+      }));
+      break;
+
+    case 'stream_start':
+      console.log(`Stream started (model: ${data.model})\n`);
+      break;
+
+    case 'content_delta':
+      // Print tokens in real-time as they arrive
+      if (data.delta_type === 'text_delta') {
+        process.stdout.write(data.delta || '');
+      } else if (data.delta_type === 'thinking_delta') {
+        console.log(`\n[Thinking: ${data.delta}]`);
+      } else if (data.delta_type === 'input_json_delta') {
+        console.log(`\n[Tool JSON: ${data.delta}]`);
+      }
+      break;
+
+    case 'stream_end':
+      console.log(`\n\nStream complete:`);
+      console.log(`  - Tokens: ${data.usage?.total_tokens}`);
+      console.log(`  - Stop reason: ${data.stop_reason}`);
+      break;
+
+    case 'result':
+      console.log(`  - Execution ID: ${data.execution_id}`);
+      break;
+
+    case 'error':
+      console.error(`Error: ${data.error}`);
+      break;
+  }
+};
+
+ws.onerror = (error: Event) => {
+  console.error('WebSocket error:', error);
+};
+```
+
 ### 8. Testing WebSocket Endpoint
 
 ```bash
 # Install websockets library
 uv add --dev websockets
 
-# Run test script
-python test_websocket.py
+# Run basic WebSocket test
+uv run python testing/test_websocket.py
+
+# Run streaming tests (Issue #5)
+uv run python testing/test_streaming.py
 ```
+
+The streaming test suite includes:
+- **Test 1**: Text deltas only (default streaming behavior)
+- **Test 2**: All event types (text + thinking + tool_use)
+- **Test 3**: Specific events (text + thinking only)
+- **Test 4**: Backward compatibility (non-streaming mode)
 
 ## Database Schema
 
@@ -424,18 +597,23 @@ This project follows **SOLID principles**:
 
 ## Version
 
-**Current Version**: 0.2.0
+**Current Version**: 0.3.0
 
 ### Recent Changes
+- ✅ **Streaming Claude API Integration** (Issue #5)
+  - Token-by-token streaming via WebSocket
+  - Opt-in streaming with `stream: true` parameter
+  - Configurable event types: text, thinking, tool_use deltas
+  - New message types: stream_start, content_delta, stream_end
+  - Full backward compatibility with non-streaming mode
+  - Works seamlessly with Agent Skills
 - ✅ **WebSocket Real-Time Execution** (Issue #4)
   - WebSocket endpoint at `/ws/agents/{agent_id}/execute`
   - Real-time status updates during agent execution
   - Persistent connections for multiple executions
-  - Foundation for future streaming capabilities
-- ✅ Added Agent Skills support (custom and Anthropic pre-built)
+- ✅ Agent Skills support (custom and Anthropic pre-built)
 - ✅ Skill-agent association system
 - ✅ Execution tracking with skills_used field
-- ✅ Optional skill enhancement (agents work with or without skills)
 
 ## License
 
@@ -455,10 +633,10 @@ For issues or questions, please open an issue on GitHub.
 
 ## Roadmap
 
-Future enhancements (post-MVP):
+Future enhancements:
 - Skill versioning
 - Skill usage analytics
 - Skill marketplace/sharing
-- WebSocket streaming for real-time agent execution
 - Frontend UI
 - Multi-user support
+- Agent webhooks for event notifications

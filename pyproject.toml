@@ -1,7 +1,7 @@
 [project]
 name = "claude-agent-control"
-version = "0.1.0"
-description = "Add your description here"
+version = "0.3.0"
+description = "A fullstack Python application for creating, monitoring, and managing Claude AI agents with Agent Skills and streaming support"
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [

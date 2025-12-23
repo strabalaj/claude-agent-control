@@ -445,77 +445,223 @@ async def websocket_execute_agent(
             variables = message.get("variables", {})
             prompt = build_prompt(agent.prompt_template, variables)
 
+            # Parse streaming parameters (Issue #5)
+            stream_enabled = message.get("stream", False)
+            stream_events = message.get("stream_events", ["text"])  # Default to text only
+
+            # Normalize "all" to include all event types
+            if "all" in stream_events:
+                stream_events = ["text", "thinking", "tool_use"]
+
             start_time = time.time()
 
             # Check if agent has any ready skills (optional feature)
             ready_skills = [skill for skill in agent.skills if skill.upload_status == "uploaded"]
 
             try:
-                # Call Anthropic API (same as REST endpoint)
-                if ready_skills:
-                    # Agent has skills - use beta API with skills
-                    skills_payload = [
-                        {
-                            "type": skill.skill_type,  # "custom" or "anthropic"
-                            "skill_id": skill.skill_id,
-                            "version": "latest"
-                        }
-                        for skill in ready_skills
-                    ]
+                # Conditional execution: streaming vs non-streaming
+                if not stream_enabled:
+                    # NON-STREAMING PATH (existing behavior)
+                    if ready_skills:
+                        # Agent has skills - use beta API with skills
+                        skills_payload = [
+                            {
+                                "type": skill.skill_type,  # "custom" or "anthropic"
+                                "skill_id": skill.skill_id,
+                                "version": "latest"
+                            }
+                            for skill in ready_skills
+                        ]
 
-                    response = client.beta.messages.create(
-                        model=agent.model,
-                        max_tokens=agent.max_tokens,
+                        response = client.beta.messages.create(
+                            model=agent.model,
+                            max_tokens=agent.max_tokens,
+                            temperature=agent.temperature,
+                            betas=["code-execution-2025-08-25", "skills-2025-10-02"],
+                            container={"skills": skills_payload},
+                            messages=[{"role": "user", "content": prompt}],
+                            tools=[{"type": "code_execution_20250825", "name": "code_execution"}]
+                        )
+                    else:
+                        # No skills attached - standard API call (works perfectly fine!)
+                        response = client.messages.create(
+                            model=agent.model,
+                            max_tokens=agent.max_tokens,
+                            temperature=agent.temperature,
+                            messages=[{"role": "user", "content": prompt}]
+                        )
+
+                    # 5. Save to database (same as REST endpoint)
+                    execution_time = time.time() - start_time
+                    output = response.content[0].text
+
+                    execution = Execution(
+                        agent_id=agent.id,
+                        agent_name=agent.name,
+                        prompt=prompt,
+                        model=response.model,
+                        output=output,
+                        input_tokens=response.usage.input_tokens,
+                        output_tokens=response.usage.output_tokens,
+                        total_tokens=response.usage.input_tokens + response.usage.output_tokens,
                         temperature=agent.temperature,
-                        betas=["code-execution-2025-08-25", "skills-2025-10-02"],
-                        container={"skills": skills_payload},
-                        messages=[{"role": "user", "content": prompt}],
-                        tools=[{"type": "code_execution_20250825", "name": "code_execution"}]
+                        execution_time=execution_time,
+                        status="success",
+                        skills_used=[s.skill_id for s in ready_skills] if ready_skills else None
                     )
+                    db.add(execution)
+                    db.commit()
+                    db.refresh(execution)
+
+                    # 6. Send result to client
+                    await websocket.send_json({
+                        "type": "result",
+                        "success": True,
+                        "output": output,
+                        "usage": {
+                            "input_tokens": response.usage.input_tokens,
+                            "output_tokens": response.usage.output_tokens,
+                            "total_tokens": response.usage.input_tokens + response.usage.output_tokens
+                        },
+                        "model": response.model,
+                        "execution_id": execution.id
+                    })
+
                 else:
-                    # No skills attached - standard API call (works perfectly fine!)
-                    response = client.messages.create(
-                        model=agent.model,
-                        max_tokens=agent.max_tokens,
-                        temperature=agent.temperature,
-                        messages=[{"role": "user", "content": prompt}]
-                    )
+                    # STREAMING PATH (Issue #5)
+                    accumulated_output = ""
+                    usage_info = None
 
-                # 5. Save to database (same as REST endpoint)
-                execution_time = time.time() - start_time
-                output = response.content[0].text
+                    # Determine streaming method based on skills
+                    if ready_skills:
+                        skills_payload = [
+                            {
+                                "type": skill.skill_type,
+                                "skill_id": skill.skill_id,
+                                "version": "latest"
+                            }
+                            for skill in ready_skills
+                        ]
 
-                execution = Execution(
-                    agent_id=agent.id,
-                    agent_name=agent.name,
-                    prompt=prompt,
-                    model=response.model,
-                    output=output,
-                    input_tokens=response.usage.input_tokens,
-                    output_tokens=response.usage.output_tokens,
-                    total_tokens=response.usage.input_tokens + response.usage.output_tokens,
-                    temperature=agent.temperature,
-                    execution_time=execution_time,
-                    status="success",
-                    skills_used=[s.skill_id for s in ready_skills] if ready_skills else None
-                )
-                db.add(execution)
-                db.commit()
-                db.refresh(execution)
+                        stream_context = client.beta.messages.stream(
+                            model=agent.model,
+                            max_tokens=agent.max_tokens,
+                            temperature=agent.temperature,
+                            betas=["code-execution-2025-08-25", "skills-2025-10-02"],
+                            container={"skills": skills_payload},
+                            messages=[{"role": "user", "content": prompt}],
+                            tools=[{"type": "code_execution_20250825", "name": "code_execution"}]
+                        )
+                    else:
+                        stream_context = client.messages.stream(
+                            model=agent.model,
+                            max_tokens=agent.max_tokens,
+                            temperature=agent.temperature,
+                            messages=[{"role": "user", "content": prompt}]
+                        )
 
-                # 6. Send result to client
-                await websocket.send_json({
-                    "type": "result",
-                    "success": True,
-                    "output": output,
-                    "usage": {
-                        "input_tokens": response.usage.input_tokens,
-                        "output_tokens": response.usage.output_tokens,
-                        "total_tokens": response.usage.input_tokens + response.usage.output_tokens
-                    },
-                    "model": response.model,
-                    "execution_id": execution.id
-                })
+                    with stream_context as stream:
+                        # Send stream_start (after "status" message)
+                        await websocket.send_json({
+                            "type": "stream_start",
+                            "message_id": None,  # Will be available in final message
+                            "model": agent.model
+                        })
+
+                        # Process stream events with filtering based on stream_events
+                        for event in stream:
+                            if event.type == "content_block_delta":
+                                # Text deltas
+                                if event.delta.type == "text_delta" and "text" in stream_events:
+                                    # Accumulate for database
+                                    accumulated_output += event.delta.text
+
+                                    # Forward to client
+                                    await websocket.send_json({
+                                        "type": "content_delta",
+                                        "delta_type": "text_delta",
+                                        "delta": event.delta.text,
+                                        "index": event.index
+                                    })
+
+                                # Thinking deltas (extended thinking)
+                                elif event.delta.type == "thinking_delta" and "thinking" in stream_events:
+                                    await websocket.send_json({
+                                        "type": "content_delta",
+                                        "delta_type": "thinking_delta",
+                                        "delta": event.delta.thinking,
+                                        "index": event.index
+                                    })
+
+                                # Tool use JSON deltas
+                                elif event.delta.type == "input_json_delta" and "tool_use" in stream_events:
+                                    await websocket.send_json({
+                                        "type": "content_delta",
+                                        "delta_type": "input_json_delta",
+                                        "delta": event.delta.partial_json,
+                                        "index": event.index
+                                    })
+
+                            elif event.type == "message_delta":
+                                # Capture final usage info (cumulative)
+                                if hasattr(event, 'usage') and event.usage:
+                                    usage_info = {
+                                        "output_tokens": event.usage.output_tokens
+                                    }
+
+                        # Get final message after stream closes
+                        final_message = stream.get_final_message()
+
+                        # Complete usage info with input tokens
+                        if usage_info:
+                            usage_info["input_tokens"] = final_message.usage.input_tokens
+                            usage_info["total_tokens"] = final_message.usage.input_tokens + usage_info["output_tokens"]
+                        else:
+                            usage_info = {
+                                "input_tokens": final_message.usage.input_tokens,
+                                "output_tokens": final_message.usage.output_tokens,
+                                "total_tokens": final_message.usage.input_tokens + final_message.usage.output_tokens
+                            }
+
+                        # Send stream_end
+                        await websocket.send_json({
+                            "type": "stream_end",
+                            "stop_reason": final_message.stop_reason,
+                            "usage": usage_info
+                        })
+
+                        # Use accumulated_output for database save
+                        output = accumulated_output
+                        execution_time = time.time() - start_time
+
+                        # Save to database
+                        execution = Execution(
+                            agent_id=agent.id,
+                            agent_name=agent.name,
+                            prompt=prompt,
+                            model=final_message.model,
+                            output=output,
+                            input_tokens=final_message.usage.input_tokens,
+                            output_tokens=final_message.usage.output_tokens,
+                            total_tokens=final_message.usage.input_tokens + final_message.usage.output_tokens,
+                            temperature=agent.temperature,
+                            execution_time=execution_time,
+                            status="success",
+                            skills_used=[s.skill_id for s in ready_skills] if ready_skills else None
+                        )
+                        db.add(execution)
+                        db.commit()
+                        db.refresh(execution)
+
+                        # Send final result message (backward compatibility)
+                        await websocket.send_json({
+                            "type": "result",
+                            "success": True,
+                            "output": output,
+                            "usage": usage_info,
+                            "model": final_message.model,
+                            "execution_id": execution.id
+                        })
 
             except Exception as e:
                 # Log failed execution to database
