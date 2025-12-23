@@ -88,6 +88,24 @@ View API documentation: `http://localhost:8000/docs`
 | DELETE | `/agents/{agent_id}` | Delete agent |
 | POST | `/agents/{agent_id}/execute` | Execute agent with optional variables |
 
+### WebSocket Real-Time Execution
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| WS | `/ws/agents/{agent_id}/execute` | Real-time agent execution with status updates |
+
+**Message Protocol:**
+- **Client → Server**: `{"type": "execute", "variables": {...}}`
+- **Server → Client**: Status updates, results, and errors as JSON messages
+
+**Connection Flow:**
+1. Connect to WebSocket endpoint
+2. Receive `connected` message with agent info
+3. Send `execute` request with optional variables
+4. Receive `status` updates during execution
+5. Receive `result` (success) or `error` (failure) message
+6. Connection stays open for multiple executions
+
 ### Skill Management
 
 | Method | Endpoint | Description |
@@ -184,6 +202,112 @@ zip -r my-skill.zip my-custom-skill/
 curl -X POST http://localhost:8000/skills/custom \
   -F "name=My Custom Skill" \
   -F "skill_directory=@my-skill.zip"
+```
+
+### 6. WebSocket Real-Time Execution (Python)
+
+```python
+import asyncio
+import websockets
+import json
+
+async def execute_agent_websocket():
+    uri = "ws://localhost:8000/ws/agents/1/execute"
+
+    async with websockets.connect(uri) as ws:
+        # 1. Receive connected message
+        connected = json.loads(await ws.recv())
+        print(f"Connected to agent: {connected['agent_name']}")
+
+        # 2. Send execute request
+        await ws.send(json.dumps({
+            "type": "execute",
+            "variables": {"document_name": "report.pdf"}
+        }))
+
+        # 3. Receive messages (status updates and result)
+        async for message in ws:
+            data = json.loads(message)
+
+            if data['type'] == 'status':
+                print(f"Status: {data['message']}")
+
+            elif data['type'] == 'result':
+                print(f"Output: {data['output']}")
+                print(f"Tokens: {data['usage']['total_tokens']}")
+                print(f"Execution ID: {data['execution_id']}")
+                break
+
+            elif data['type'] == 'error':
+                print(f"Error: {data['error']}")
+                break
+
+asyncio.run(execute_agent_websocket())
+```
+
+### 7. WebSocket Real-Time Execution (TypeScript)
+
+```typescript
+interface WSMessage {
+  type: 'connected' | 'status' | 'result' | 'error';
+  agent_id?: number;
+  agent_name?: string;
+  message?: string;
+  output?: string;
+  usage?: {
+    input_tokens: number;
+    output_tokens: number;
+    total_tokens: number;
+  };
+  model?: string;
+  execution_id?: number;
+  error?: string;
+}
+
+const ws = new WebSocket('ws://localhost:8000/ws/agents/1/execute');
+
+ws.onmessage = (event: MessageEvent) => {
+  const data: WSMessage = JSON.parse(event.data);
+
+  switch(data.type) {
+    case 'connected':
+      console.log(`Connected to agent: ${data.agent_name}`);
+      // Send execute request
+      ws.send(JSON.stringify({
+        type: 'execute',
+        variables: { document_name: 'report.pdf' }
+      }));
+      break;
+
+    case 'status':
+      console.log(`Status: ${data.message}`);
+      break;
+
+    case 'result':
+      console.log(`Output: ${data.output}`);
+      console.log(`Tokens: ${data.usage?.total_tokens}`);
+      console.log(`Execution ID: ${data.execution_id}`);
+      break;
+
+    case 'error':
+      console.error(`Error: ${data.error}`);
+      break;
+  }
+};
+
+ws.onerror = (error: Event) => {
+  console.error('WebSocket error:', error);
+};
+```
+
+### 8. Testing WebSocket Endpoint
+
+```bash
+# Install websockets library
+uv add --dev websockets
+
+# Run test script
+python test_websocket.py
 ```
 
 ## Database Schema
@@ -300,9 +424,14 @@ This project follows **SOLID principles**:
 
 ## Version
 
-**Current Version**: 0.1.1
+**Current Version**: 0.2.0
 
 ### Recent Changes
+- ✅ **WebSocket Real-Time Execution** (Issue #4)
+  - WebSocket endpoint at `/ws/agents/{agent_id}/execute`
+  - Real-time status updates during agent execution
+  - Persistent connections for multiple executions
+  - Foundation for future streaming capabilities
 - ✅ Added Agent Skills support (custom and Anthropic pre-built)
 - ✅ Skill-agent association system
 - ✅ Execution tracking with skills_used field

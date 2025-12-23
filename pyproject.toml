@@ -13,3 +13,8 @@ dependencies = [
     "sqlalchemy>=2.0.44",
     "uvicorn>=0.38.0",
 ]
+
+[dependency-groups]
+dev = [
+    "websockets>=15.0.1",
+]

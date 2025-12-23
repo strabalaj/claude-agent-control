@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi import FastAPI, HTTPException, UploadFile, File, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from anthropic import Anthropic
@@ -113,13 +113,33 @@ class AgentSkillDetachRequest(BaseModel):
     skill_ids: List[int] = Field(..., min_length=1)
 
 
+##### Helper Functions #####
+
+def build_prompt(template: str, variables: dict) -> str:
+    """
+    Build prompt from template by substituting variables.
+    Used by both REST and WebSocket endpoints.
+
+    Args:
+        template: Prompt template with placeholders like {variable_name}
+        variables: Dictionary of variable names to values
+
+    Returns:
+        Prompt string with all variables substituted
+    """
+    prompt = template
+    for key, value in variables.items():
+        prompt = prompt.replace(f"{{{key}}}", str(value))
+    return prompt
+
+
 ###### endpoints #######
 # App's root/landing page 
 @app.get("/")
 async def root():
     return {
         "message": "Claude Agent Control Center API",
-        "version": "0.1.1",
+        "version": "0.2.0",
         "status": "running"
     }
 
@@ -270,12 +290,11 @@ async def execute_saved_agent(agent_id: int, variables: Optional[dict] = None, d
     agent = db.query(Agent).filter(Agent.id == agent_id).first()
     if not agent:
         raise HTTPException(status_code = 404, detail = "Agent was not found ")
-    
-    prompt = agent.prompt_template
-    if variables:
-        for key, value in variables.items():
-            prompt = prompt.replace(f"{{{key}}}", str(value))
-    
+
+    # Build prompt using helper function (supports both REST and WebSocket)
+    variables = variables or {}
+    prompt = build_prompt(agent.prompt_template, variables)
+
     start_time = time.time()
 
     # Check if agent has any ready skills (optional feature)
@@ -360,6 +379,165 @@ async def execute_saved_agent(agent_id: int, variables: Optional[dict] = None, d
             status_code=500,
             detail=f"Agent execution failed: {str(e)}"
         )
+
+@app.websocket("/ws/agents/{agent_id}/execute")
+async def websocket_execute_agent(
+    websocket: WebSocket,
+    agent_id: int,
+    db: Session = Depends(get_db)
+):
+    """
+    WebSocket endpoint for real-time agent execution.
+
+    Issue #4: Basic connection and execution flow (foundation for future streaming)
+    Foundation for Issue #5 (Anthropic streaming) and #6 (token tracking)
+
+    Protocol:
+    - Client sends: {"type": "execute", "variables": {...}}
+    - Server sends status updates and final result
+    - Connection can be reused for multiple executions
+    """
+    # Validate agent exists before accepting connection
+    agent = db.query(Agent).filter(Agent.id == agent_id).first()
+    if not agent:
+        await websocket.close(code=1008, reason="Agent not found")
+        return
+
+    # Accept WebSocket connection
+    await websocket.accept()
+
+    # Send connected message with agent info
+    await websocket.send_json({
+        "type": "connected",
+        "agent_id": agent.id,
+        "agent_name": agent.name
+    })
+
+    try:
+        # Message loop - wait for execute requests
+        while True:
+            # 1. Receive message from client
+            message = await websocket.receive_json()
+
+            # 2. Validate message type
+            if message.get("type") != "execute":
+                await websocket.send_json({
+                    "type": "error",
+                    "error": f"Unknown message type: {message.get('type')}"
+                })
+                continue
+
+            # 3. Send status update
+            await websocket.send_json({
+                "type": "status",
+                "message": "Executing agent..."
+            })
+
+            # 4. Build prompt and execute (mirror REST logic)
+            variables = message.get("variables", {})
+            prompt = build_prompt(agent.prompt_template, variables)
+
+            start_time = time.time()
+
+            # Check if agent has any ready skills (optional feature)
+            skill_ids = [skill.skill_id for skill in agent.skills if skill.upload_status == "uploaded"]
+
+            try:
+                # Call Anthropic API (same as REST endpoint)
+                if skill_ids:
+                    # Agent has skills - use beta API with skills
+                    response = client.messages.create(
+                        model=agent.model,
+                        max_tokens=agent.max_tokens,
+                        temperature=agent.temperature,
+                        messages=[{"role": "user", "content": prompt}],
+                        betas=["code-execution-2025-08-25", "skills-2025-10-02"],
+                        container={
+                            "skills": [{"type": "skill", "id": sid} for sid in skill_ids]
+                        }
+                    )
+                else:
+                    # No skills attached - standard API call (works perfectly fine!)
+                    response = client.messages.create(
+                        model=agent.model,
+                        max_tokens=agent.max_tokens,
+                        temperature=agent.temperature,
+                        messages=[{"role": "user", "content": prompt}]
+                    )
+
+                # 5. Save to database (same as REST endpoint)
+                execution_time = time.time() - start_time
+                output = response.content[0].text
+
+                execution = Execution(
+                    agent_id=agent.id,
+                    agent_name=agent.name,
+                    prompt=prompt,
+                    model=response.model,
+                    output=output,
+                    input_tokens=response.usage.input_tokens,
+                    output_tokens=response.usage.output_tokens,
+                    total_tokens=response.usage.input_tokens + response.usage.output_tokens,
+                    temperature=agent.temperature,
+                    execution_time=execution_time,
+                    status="success",
+                    skills_used=skill_ids if skill_ids else None
+                )
+                db.add(execution)
+                db.commit()
+                db.refresh(execution)
+
+                # 6. Send result to client
+                await websocket.send_json({
+                    "type": "result",
+                    "success": True,
+                    "output": output,
+                    "usage": {
+                        "input_tokens": response.usage.input_tokens,
+                        "output_tokens": response.usage.output_tokens,
+                        "total_tokens": response.usage.input_tokens + response.usage.output_tokens
+                    },
+                    "model": response.model,
+                    "execution_id": execution.id
+                })
+
+            except Exception as e:
+                # Log failed execution to database
+                execution_time = time.time() - start_time
+                execution = Execution(
+                    agent_id=agent.id,
+                    agent_name=agent.name,
+                    prompt=prompt,
+                    model=agent.model,
+                    output="",
+                    input_tokens=0,
+                    output_tokens=0,
+                    total_tokens=0,
+                    temperature=agent.temperature,
+                    execution_time=execution_time,
+                    status="failed",
+                    error_message=str(e)
+                )
+                db.add(execution)
+                db.commit()
+                db.refresh(execution)
+
+                # Send error to client
+                await websocket.send_json({
+                    "type": "error",
+                    "error": str(e),
+                    "execution_id": execution.id
+                })
+
+    except WebSocketDisconnect:
+        # Client disconnected gracefully - no action needed
+        pass
+    except Exception as e:
+        # Unexpected error - attempt to close connection gracefully
+        try:
+            await websocket.close(code=1011, reason="Internal server error")
+        except:
+            pass
 
 @app.get("/executions")
 async def list_executions(skip: int = 0, limit: int = 50, agent_id: Optional[int] = None, db: Session = Depends(get_db)):
