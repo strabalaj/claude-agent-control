@@ -298,20 +298,28 @@ async def execute_saved_agent(agent_id: int, variables: Optional[dict] = None, d
     start_time = time.time()
 
     # Check if agent has any ready skills (optional feature)
-    skill_ids = [skill.skill_id for skill in agent.skills if skill.upload_status == "uploaded"]
+    ready_skills = [skill for skill in agent.skills if skill.upload_status == "uploaded"]
 
     try:
-        if skill_ids:
+        if ready_skills:
             # Agent has skills - use beta API with skills
-            message = client.messages.create(
+            skills_payload = [
+                {
+                    "type": skill.skill_type,  # "custom" or "anthropic"
+                    "skill_id": skill.skill_id,
+                    "version": "latest"
+                }
+                for skill in ready_skills
+            ]
+
+            message = client.beta.messages.create(
                 model=agent.model,
                 max_tokens=agent.max_tokens,
                 temperature=agent.temperature,
-                messages=[{"role": "user", "content": prompt}],
                 betas=["code-execution-2025-08-25", "skills-2025-10-02"],
-                container={
-                    "skills": [{"type": "skill", "id": sid} for sid in skill_ids]
-                }
+                container={"skills": skills_payload},
+                messages=[{"role": "user", "content": prompt}],
+                tools=[{"type": "code_execution_20250825", "name": "code_execution"}]
             )
         else:
             # No skills attached - standard API call (works perfectly fine!)
@@ -338,7 +346,7 @@ async def execute_saved_agent(agent_id: int, variables: Optional[dict] = None, d
             temperature = agent.temperature,
             execution_time = execution_time,
             status = "success",
-            skills_used = skill_ids if skill_ids else None  # Track skills if used
+            skills_used = [s.skill_id for s in ready_skills] if ready_skills else None  # Track skills if used
         )
         db.add(execution)
         db.commit()
@@ -440,21 +448,29 @@ async def websocket_execute_agent(
             start_time = time.time()
 
             # Check if agent has any ready skills (optional feature)
-            skill_ids = [skill.skill_id for skill in agent.skills if skill.upload_status == "uploaded"]
+            ready_skills = [skill for skill in agent.skills if skill.upload_status == "uploaded"]
 
             try:
                 # Call Anthropic API (same as REST endpoint)
-                if skill_ids:
+                if ready_skills:
                     # Agent has skills - use beta API with skills
-                    response = client.messages.create(
+                    skills_payload = [
+                        {
+                            "type": skill.skill_type,  # "custom" or "anthropic"
+                            "skill_id": skill.skill_id,
+                            "version": "latest"
+                        }
+                        for skill in ready_skills
+                    ]
+
+                    response = client.beta.messages.create(
                         model=agent.model,
                         max_tokens=agent.max_tokens,
                         temperature=agent.temperature,
-                        messages=[{"role": "user", "content": prompt}],
                         betas=["code-execution-2025-08-25", "skills-2025-10-02"],
-                        container={
-                            "skills": [{"type": "skill", "id": sid} for sid in skill_ids]
-                        }
+                        container={"skills": skills_payload},
+                        messages=[{"role": "user", "content": prompt}],
+                        tools=[{"type": "code_execution_20250825", "name": "code_execution"}]
                     )
                 else:
                     # No skills attached - standard API call (works perfectly fine!)
@@ -481,7 +497,7 @@ async def websocket_execute_agent(
                     temperature=agent.temperature,
                     execution_time=execution_time,
                     status="success",
-                    skills_used=skill_ids if skill_ids else None
+                    skills_used=[s.skill_id for s in ready_skills] if ready_skills else None
                 )
                 db.add(execution)
                 db.commit()
